@@ -28,6 +28,7 @@ import { sanitizeEnv } from '../supervisor/env-sanitizer.js';
 // ensure the worker daemon is up without importing this entire module — which
 // transitively pulls in the SQLite database layer via ChromaSync/DatabaseManager.
 import { ensureWorkerStarted as ensureWorkerStartedShared } from './worker-spawner.js';
+import { ObserverSessionRegistry } from './worker/ObserverSessionRegistry.js';
 
 // Re-export for backward compatibility — canonical implementation in shared/plugin-state.ts
 export { isPluginDisabledInClaudeSettings } from '../shared/plugin-state.js';
@@ -508,6 +509,21 @@ export class WorkerService {
         }
       }, 2 * 60 * 1000);
 
+      // Sweep observer-sessions orphans left from any previous crash (#2126)
+      const observerRegistry = new ObserverSessionRegistry();
+      const startupSweep = observerRegistry.sweepOrphans({ maxAgeMs: 4 * 60 * 60 * 1000 });
+      if (startupSweep.staleRemoved > 0 || startupSweep.zombiesKilled > 0) {
+        logger.info('SYSTEM', 'Observer-sessions startup sweep complete', startupSweep);
+      }
+      // Periodic sweep every 30 min so zombies never accumulate between sessions (#2126)
+      const observerSweepInterval = setInterval(() => {
+        const sweep = observerRegistry.sweepOrphans();
+        if (sweep.staleRemoved > 0 || sweep.zombiesKilled > 0) {
+          logger.info('SYSTEM', 'Observer-sessions periodic sweep', sweep);
+        }
+      }, 30 * 60 * 1000);
+      observerSweepInterval.unref();
+
       // Auto-recover orphaned queues (fire-and-forget with error logging)
       this.processPendingQueues(50).then(result => {
         if (result.sessionsStarted > 0) {
@@ -975,6 +991,16 @@ export class WorkerService {
     if (this.staleSessionReaperInterval) {
       clearInterval(this.staleSessionReaperInterval);
       this.staleSessionReaperInterval = null;
+    // Final observer-sessions sweep on clean shutdown (#2126)
+    try {
+      const observerRegistry = new ObserverSessionRegistry();
+      const shutdownSweep = observerRegistry.sweepOrphans({ maxAgeMs: 0 });
+      if (shutdownSweep.staleRemoved > 0 || shutdownSweep.zombiesKilled > 0) {
+        logger.info('SYSTEM', 'Observer-sessions shutdown sweep complete', shutdownSweep);
+      }
+    } catch (e) {
+      logger.error('SYSTEM', 'Observer-sessions shutdown sweep failed', { error: e instanceof Error ? e.message : String(e) });
+    }
     }
 
     await performGracefulShutdown({
